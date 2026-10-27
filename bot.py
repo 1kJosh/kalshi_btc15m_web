@@ -363,6 +363,16 @@ def tick(api: API, journal: Journal, cfg: Config):
     # Fee multiplier is read from current Kalshi series data; no hardcoded override.
     multiplier = api.series_fee_multiplier()
     book = api.orderbook(ticker)
+    yes_bid, no_bid = _top(book, 'yes_dollars'), _top(book, 'no_dollars')
+    p_yes = model_probability(spot, strike, remain, cfg.annual_vol)
+    yes_ask = (Decimal('1') - no_bid[0]) if no_bid else None
+    no_ask = (Decimal('1') - yes_bid[0]) if yes_bid else None
+    spread = (yes_ask - yes_bid[0]) if yes_ask is not None and yes_bid else None
+    LOG.info('MARKET_SNAPSHOT ticker=%s spot=%s strike=%s seconds=%d yes_probability=%.4f no_probability=%.4f yes_ask=%s no_ask=%s spread=%s',
+             ticker, spot, strike, remain, p_yes, 1-p_yes,
+             yes_ask if yes_ask is not None else 'NA',
+             no_ask if no_ask is not None else 'NA',
+             spread if spread is not None else 'NA')
     candidate = evaluate(book, spot, strike, remain, multiplier, cfg)
     if not candidate:
         LOG.info('%s spot=%s strike=%s seconds=%d: no eligible edge', ticker, spot, strike, remain)
