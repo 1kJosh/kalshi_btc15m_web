@@ -78,6 +78,15 @@ def scan():
         st.session_state.running = False
     st.session_state.last_scan = time.monotonic()
 
+def predictions_to_csv(rows):
+    import csv, io
+    buffer = io.StringIO()
+    if rows:
+        writer = csv.DictWriter(buffer,fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return buffer.getvalue()
+
 @st.fragment(run_every='5s')
 def monitor():
     running = st.session_state.running
@@ -106,6 +115,45 @@ def monitor():
             st.info('Decision: no completed entry signal in this scan. Check the log for details.')
     else:
         st.info('No market snapshot yet. Click Scan once, or Start, to load one.')
+    st.subheader('Prediction accuracy tracker')
+    st.caption('One forecast per 15-minute market (the first evaluated scan). Only confirmed Kalshi YES/NO results count as settled. Skipped trades are included.')
+    if DB.exists():
+        try:
+            with sqlite3.connect(f'file:{DB}?mode=ro', uri=True) as con:
+                con.row_factory = sqlite3.Row
+                predictions = [dict(r) for r in con.execute(
+                    'SELECT ticker,created,spot,strike,seconds_remaining,yes_probability,predicted_side,yes_ask,no_ask,decision,result,settled_at FROM predictions ORDER BY created DESC LIMIT 1000')]
+            completed = [r for r in predictions if r['result'] in ('YES','NO')]
+            p1,p2,p3,p4 = st.columns(4)
+            p1.metric('Markets recorded',len(predictions))
+            p2.metric('Settled predictions',len(completed))
+            p3.metric('Directional accuracy',f"{100*sum(r['predicted_side']==r['result'] for r in completed)/len(completed):.1f}%" if completed else '—')
+            p4.metric('Brier score (lower better)',f"{sum((float(r['yes_probability']) - (1 if r['result']=='YES' else 0))**2 for r in completed)/len(completed):.3f}" if completed else '—')
+            if completed:
+                st.caption('Brier score measures probability error (0 best, 1 worst). Directional accuracy alone does not measure profitability. Results are preliminary, not validated.')
+                ordered = sorted(completed,key=lambda r:r['created'])
+                hits=0
+                history=[]
+                for i,r in enumerate(ordered,1):
+                    hits += r['predicted_side']==r['result']
+                    history.append({'Settled market':i,'Cumulative accuracy (%)':round(100*hits/i,2)})
+                st.line_chart(history,x='Settled market',y='Cumulative accuracy (%)')
+            else:
+                st.info('No settled predictions yet. The tracker will check for official market results on subsequent scans.')
+            st.dataframe([{
+                'Market':r['ticker'],'Recorded (UTC)':r['created'],
+                'YES forecast':f"{100*float(r['yes_probability']):.1f}%",
+                'Predicted':r['predicted_side'],'Decision':r['decision'],
+                'Actual result':r['result'] or 'Pending',
+                'Correct':('Yes' if r['predicted_side']==r['result'] else 'No') if r['result'] else 'Pending'
+            } for r in predictions[:100]],hide_index=True,width='stretch')
+            st.download_button('Download prediction history (CSV)',
+                data=predictions_to_csv(predictions),
+                file_name='kalshi_predictions.csv',mime='text/csv')
+        except sqlite3.OperationalError as exc:
+            st.info(f'Prediction tracker waiting for first scan: {exc}')
+    else:
+        st.info('Run a scan to begin tracking predictions.')
     if DB.exists():
         try:
             con = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
