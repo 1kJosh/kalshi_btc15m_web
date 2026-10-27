@@ -188,5 +188,62 @@ def monitor():
         st.info('No simulated trades yet. Start scanning to begin.')
     with st.expander('Latest scan log'):
         st.code(st.session_state.scan_log)
+
+# Kalshi close countdown (official market close timestamp).
+# The server timestamp is re-read each second; it is not a local 15-minute reset.
+@st.fragment(run_every='1s')
+def market_countdown():
+    from datetime import datetime, timezone
+    snap = st.session_state.get('snapshot') or {}
+    raw = snap.get('close_time')
+    st.subheader('Kalshi market close countdown')
+    if not raw:
+        st.info('Waiting for a scan to provide the market close time.')
+        return
+    try:
+        close = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        if close.tzinfo is None:
+            st.warning('Market close timestamp has no timezone; countdown unavailable.')
+            return
+        seconds = max(0, int((close - datetime.now(timezone.utc)).total_seconds()))
+        st.metric('Time until market close', f'{seconds//60:02d}:{seconds%60:02d}')
+        st.progress(min(1.0, seconds / 900))
+        if seconds == 0:
+            st.info('Market close time reached. Awaiting the next scan for the new market.')
+        st.caption('Based on Kalshi close_time and server UTC clock. Minor clock/network differences may remain.')
+    except (ValueError, TypeError) as exc:
+        st.warning(f'Invalid market close timestamp: {exc}')
+
+market_countdown()
 monitor()
+
+@st.fragment(run_every='5s')
+def show_filter_explanations():
+    import re
+    st.subheader('Entry filter diagnostics')
+    log = st.session_state.get('scan_log', '')
+    lines = [line.split('FILTER_CHECK ', 1)[1] for line in log.splitlines()
+             if 'FILTER_CHECK ' in line]
+    if not lines:
+        window = [line.split('ENTRY_WINDOW_SKIP ', 1)[1] for line in log.splitlines()
+                  if 'ENTRY_WINDOW_SKIP ' in line]
+        if window:
+            st.info('Scan skipped because the market is outside the permitted entry window.')
+            st.code(window[-1])
+        else:
+            st.info('Run Scan once to load filter diagnostics. Older scans may not contain them.')
+        return
+    rows = []
+    for line in lines[-2:]:
+        fields = dict(re.findall(r'(\w+)=([^\s]+)', line))
+        rows.append({'Side': fields.get('side'), 'Status': fields.get('status'),
+                     'Failed checks': fields.get('reason', '').replace(',', ', '),
+                     'Ask ($)': fields.get('ask'), 'Model probability': fields.get('probability'),
+                     'Best net edge': fields.get('edge'),
+                     'Liquidity': fields.get('liquidity'), 'Spread ($)': fields.get('spread'),
+                     'Spot-strike gap ($)': fields.get('gap')})
+    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.caption('Diagnostics explain the current strategy rules, not proof of a profitable trading edge.')
+
+show_filter_explanations()
 st.caption('Model uses Coinbase BTC spot as a proxy, not the CF Benchmarks BRTI used for settlement. Differences can reverse outcomes. Browser controls do not make this a 24/7 hosted worker.')
