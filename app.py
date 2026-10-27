@@ -154,6 +154,33 @@ def monitor():
             st.info(f'Prediction tracker waiting for first scan: {exc}')
     else:
         st.info('Run a scan to begin tracking predictions.')
+    st.subheader('Shadow trades — rejected and eligible quotes')
+    st.caption('One hypothetical 1-contract YES and NO purchase per market, at the first eligible-window scan. Includes estimated exchange fee plus $0.02 buffer. No orders placed; fills, slippage and settlement execution are not guaranteed.')
+    if DB.exists():
+        try:
+            with sqlite3.connect(f'file:{DB}?mode=ro', uri=True) as con:
+                con.row_factory = sqlite3.Row
+                shadow = [dict(r) for r in con.execute(
+                    'SELECT ticker,side,created,ask,estimated_fee,estimated_cost,model_probability,model_edge,filter_reasons,result,estimated_pnl FROM shadow_trades ORDER BY created DESC LIMIT 2000')]
+            settled_shadow = [r for r in shadow if r['estimated_pnl'] is not None]
+            rejected = [r for r in settled_shadow if r['filter_reasons'] != 'eligible']
+            eligible = [r for r in settled_shadow if r['filter_reasons'] == 'eligible']
+            m1,m2,m3 = st.columns(3)
+            m1.metric('Shadow quotes recorded',len(shadow))
+            m2.metric('Settled rejected quotes',len(rejected))
+            m3.metric('Rejected quote hypothetical P/L',
+                      f"${sum(r['estimated_pnl'] for r in rejected):.2f}" if rejected else '—')
+            if settled_shadow:
+                st.caption(f"Eligible quotes settled: {len(eligible)} | Their hypothetical P/L: ${sum(r['estimated_pnl'] for r in eligible):.2f}. YES and NO quotes from the same market are alternative scenarios, not a combined portfolio.")
+            st.dataframe(shadow[:200],hide_index=True,width='stretch')
+            st.download_button('Download shadow-trade history (CSV)',
+                               data=predictions_to_csv(shadow),
+                               file_name='kalshi_shadow_trades.csv',mime='text/csv')
+        except sqlite3.OperationalError:
+            st.info('Shadow tracker will appear after the first scan with the updated bot.py.')
+    else:
+        st.info('Run a scan to start recording shadow quotes.')
+
     if DB.exists():
         try:
             con = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
