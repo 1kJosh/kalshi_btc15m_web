@@ -1,5 +1,5 @@
 """Browser control panel. Paper only; scans while a browser session stays connected."""
-import os, sqlite3, subprocess, sys, time
+import os, re, sqlite3, subprocess, sys, time
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -33,6 +33,8 @@ if 'last_scan' not in st.session_state:
     st.session_state.last_scan = 0.0
 if 'scan_log' not in st.session_state:
     st.session_state.scan_log = 'No scans yet.'
+if 'snapshot' not in st.session_state:
+    st.session_state.snapshot = None
 
 with st.sidebar:
     st.header('Controls')
@@ -61,6 +63,10 @@ def scan():
         proc = subprocess.run([sys.executable, str(ROOT/'bot.py'), '--once'], cwd=ROOT,
                               env=env, text=True, capture_output=True, timeout=22)
         st.session_state.scan_log = (proc.stdout + '\n' + proc.stderr)[-7000:] or 'No output.'
+        snapshots = re.findall(r'MARKET_SNAPSHOT ([^\\n]+)', st.session_state.scan_log)
+        if snapshots:
+            fields = dict(re.findall(r'(\\w+)=([^\\s]+)', snapshots[-1]))
+            st.session_state.snapshot = fields
         if proc.returncode:
             st.session_state.running = False
             st.session_state.scan_log += f'\nScan exited with status {proc.returncode}.'
@@ -78,6 +84,28 @@ def monitor():
     st.subheader('Status: ' + ('🟢 Scanning' if running else '⚪ Stopped'))
     if st.session_state.pop('force_scan', False) or (running and time.monotonic() - st.session_state.last_scan >= interval):
         scan()
+    snap = st.session_state.snapshot
+    st.subheader('Latest market snapshot')
+    if snap:
+        st.caption('From the most recent successful market evaluation; not a live price feed.')
+        x,y,z = st.columns(3)
+        x.metric('BTC spot (Coinbase)', f"${float(snap['spot']):,.2f}")
+        y.metric('Kalshi strike', f"${float(snap['strike']):,.2f}")
+        z.metric('Time remaining', f"{int(float(snap['seconds'])) // 60}m {int(float(snap['seconds'])) % 60}s")
+        a,b,c,d = st.columns(4)
+        a.metric('Model YES probability', f"{float(snap['yes_probability'])*100:.1f}%")
+        b.metric('Model NO probability', f"{float(snap['no_probability'])*100:.1f}%")
+        c.metric('YES ask', 'Unavailable' if snap['yes_ask']=='NA' else f"${float(snap['yes_ask']):.2f}")
+        d.metric('NO ask', 'Unavailable' if snap['no_ask']=='NA' else f"${float(snap['no_ask']):.2f}")
+        st.caption(f"Market: {snap['ticker']} | Spread: {snap['spread']}. Model probabilities are uncalibrated estimates, not forecasts.")
+        if 'no eligible edge' in st.session_state.scan_log:
+            st.info('Decision: SKIP — no trade passed all price, liquidity, spread, model-edge and risk filters.')
+        elif 'SIGNAL ' in st.session_state.scan_log:
+            st.info('Decision: simulated trade signal generated. Check the scan log for details.')
+        else:
+            st.info('Decision: no completed entry signal in this scan. Check the log for details.')
+    else:
+        st.info('No market snapshot yet. Click Scan once, or Start, to load one.')
     if DB.exists():
         try:
             con = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
@@ -91,6 +119,19 @@ def monitor():
             c2.metric('Simulated budget reserved', f"${sum(float(r['reserved']) for r in today_rows):.2f}")
             settled = [r for r in rows if r['estimated_pnl'] is not None]
             c3.metric('Estimated settled P/L (shown history)', f"${sum(float(r['estimated_pnl']) for r in settled):.2f}")
+            finished = [r for r in rows if r['status']=='settled' and r['estimated_pnl'] is not None]
+            if finished:
+                wins = sum(float(r['estimated_pnl']) > 0 for r in finished)
+                st.metric('Simulated settled win rate', f"{100*wins/len(finished):.1f}%", help=f'{wins} of {len(finished)} settled trades in displayed history')
+                chart_rows = sorted(finished, key=lambda r: r['created'])
+                running_pnl = 0.0
+                chart = []
+                for r in chart_rows:
+                    running_pnl += float(r['estimated_pnl'])
+                    chart.append({'Trade':len(chart)+1,'Cumulative estimated P/L ($)':running_pnl})
+                st.line_chart(chart, x='Trade', y='Cumulative estimated P/L ($)')
+            else:
+                st.caption('Win rate and P/L chart will appear after simulated trades settle.')
             st.subheader('Trade history')
             st.dataframe(rows, use_container_width=True, hide_index=True)
         except sqlite3.Error as exc:
