@@ -14,7 +14,7 @@ import fcntl
 import logging
 import math
 import os
-import sqlite3
+import psycopg
 import sys
 import time
 import uuid
@@ -85,6 +85,8 @@ class Config:
     @classmethod
     def from_env(cls):
         mode = os.getenv('MODE', 'paper').strip().lower()
+        if mode != 'paper':
+            raise ValueError('This Supabase cloud version is PAPER ONLY')
         if mode not in {'paper', 'live'}:
             raise ValueError('MODE must be paper or live')
         if mode == 'live':
@@ -322,22 +324,25 @@ def explain_filters(book: dict, spot: Decimal, strike: Decimal, remaining: float
 
 class Journal:
     def __init__(self):
-        HERE.joinpath('data').mkdir(exist_ok=True)
-        self.db = sqlite3.connect(HERE / 'data' / 'trades.sqlite3')
-        self.db.execute('''CREATE TABLE IF NOT EXISTS trades (
+        url = os.getenv('SUPABASE_DB_URL', '').strip()
+        if not url:
+            raise RuntimeError('SUPABASE_DB_URL is required; refusing to use ephemeral SQLite storage')
+        self.db = psycopg.connect(url, connect_timeout=10, sslmode='require')
+        self.db.execute('CREATE SCHEMA IF NOT EXISTS bot_private')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS bot_private.bot_trades (
             mode TEXT NOT NULL, ticker TEXT NOT NULL, day TEXT NOT NULL,
             created TEXT NOT NULL, side TEXT NOT NULL, count INTEGER NOT NULL,
             price TEXT NOT NULL, fee TEXT NOT NULL, reserved TEXT NOT NULL,
             model_probability REAL NOT NULL, edge REAL NOT NULL,
             status TEXT NOT NULL, order_id TEXT, result TEXT, estimated_pnl TEXT,
             PRIMARY KEY (mode,ticker))''')
-        self.db.execute('''CREATE TABLE IF NOT EXISTS predictions (
+        self.db.execute('''CREATE TABLE IF NOT EXISTS bot_private.bot_predictions (
             ticker TEXT PRIMARY KEY, created TEXT NOT NULL,
             spot TEXT NOT NULL, strike TEXT NOT NULL, seconds_remaining INTEGER NOT NULL,
             yes_probability REAL NOT NULL, predicted_side TEXT NOT NULL,
             yes_ask TEXT, no_ask TEXT, decision TEXT NOT NULL,
             result TEXT, settled_at TEXT)''')
-        self.db.execute('''CREATE TABLE IF NOT EXISTS shadow_trades (
+        self.db.execute('''CREATE TABLE IF NOT EXISTS bot_private.bot_shadow_trades (
             ticker TEXT NOT NULL, side TEXT NOT NULL, created TEXT NOT NULL,
             ask REAL NOT NULL, estimated_fee REAL NOT NULL,
             estimated_cost REAL NOT NULL, model_probability REAL NOT NULL,
@@ -358,10 +363,10 @@ class Journal:
                 cost = ask + fee + Decimal('0.02')
                 probability = float(check['probability'])
                 edge = probability - float(cost)
-                self.db.execute('''INSERT OR IGNORE INTO shadow_trades
+                self.db.execute('''INSERT INTO bot_private.bot_shadow_trades
                     (ticker,side,created,ask,estimated_fee,estimated_cost,
                      model_probability,model_edge,filter_reasons)
-                    VALUES (?,?,?,?,?,?,?,?,?)''',
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
                     (ticker,check['side'],now_utc().isoformat(),float(ask),
                      float(fee),float(cost),probability,edge,check['reason']))
             except (KeyError, ValueError, ArithmeticError):
@@ -370,9 +375,9 @@ class Journal:
 
     def save_prediction(self, ticker, spot, strike, remain, p_yes, yes_ask, no_ask, decision):
         # One independent observation per market: avoid inflating accuracy by repeated scans.
-        self.db.execute('''INSERT OR IGNORE INTO predictions
+        self.db.execute('''INSERT INTO bot_private.bot_predictions
             (ticker,created,spot,strike,seconds_remaining,yes_probability,predicted_side,yes_ask,no_ask,decision)
-            VALUES (?,?,?,?,?,?,?,?,?,?)''',
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
             (ticker,now_utc().isoformat(),str(spot),str(strike),int(remain),float(p_yes),
              'YES' if p_yes >= 0.5 else 'NO',str(yes_ask) if yes_ask is not None else None,
              str(no_ask) if no_ask is not None else None,decision))
@@ -380,46 +385,46 @@ class Journal:
 
     def pending_predictions(self, limit=15):
         return [r[0] for r in self.db.execute(
-            'SELECT ticker FROM predictions WHERE result IS NULL ORDER BY created LIMIT ?', (limit,))]
+            'SELECT ticker FROM bot_private.bot_predictions WHERE result IS NULL ORDER BY created LIMIT %s', (limit,))]
 
     def settle_prediction(self, ticker, result):
-        self.db.execute('UPDATE predictions SET result=?, settled_at=? WHERE ticker=? AND result IS NULL',
+        self.db.execute('UPDATE bot_private.bot_predictions SET result=%s, settled_at=%s WHERE ticker=%s AND result IS NULL',
                         (result,now_utc().isoformat(),ticker))
-        self.db.execute('''UPDATE shadow_trades
-            SET result=?, estimated_pnl=CASE WHEN side=? THEN 1.0-estimated_cost
+        self.db.execute('''UPDATE bot_private.bot_shadow_trades
+            SET result=%s, estimated_pnl=CASE WHEN side=%s THEN 1.0-estimated_cost
                                               ELSE -estimated_cost END,
-                settled_at=?
-            WHERE ticker=? AND result IS NULL''',
+                settled_at=%s
+            WHERE ticker=%s AND result IS NULL''',
             (result,result,now_utc().isoformat(),ticker))
         self.db.commit()
 
     def has_attempt(self, mode: str, ticker: str) -> bool:
-        return self.db.execute('SELECT 1 FROM trades WHERE mode=? AND ticker=?',
+        return self.db.execute('SELECT 1 FROM bot_private.bot_trades WHERE mode=%s AND ticker=%s',
                                (mode, ticker)).fetchone() is not None
 
     def limits(self, mode: str, day: str) -> tuple[int, Decimal]:
-        rows = self.db.execute('SELECT reserved FROM trades WHERE mode=? AND day=?',
+        rows = self.db.execute('SELECT reserved FROM bot_private.bot_trades WHERE mode=%s AND day=%s',
                                (mode, day)).fetchall()
         return len(rows), sum((Decimal(x[0]) for x in rows), Decimal('0'))
 
     def pending(self, mode: str) -> list[tuple]:
-        return self.db.execute('''SELECT ticker,side,count,price,fee FROM trades
-                                  WHERE mode=? AND status='filled' ''', (mode,)).fetchall()
+        return self.db.execute('''SELECT ticker,side,count,price,fee FROM bot_private.bot_trades
+                                  WHERE mode=%s AND status='filled' ''', (mode,)).fetchall()
 
     def reserve(self, cfg: Config, market: dict, c: Choice, day: str):
         # Durable before network request: on timeout/restart, never repeat the trade.
-        self.db.execute('''INSERT INTO trades
+        self.db.execute('''INSERT INTO bot_private.bot_trades
           (mode,ticker,day,created,side,count,price,fee,reserved,model_probability,edge,status)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
           (cfg.mode, market['ticker'], day, now_utc().isoformat(), c.side, c.count,
            money(c.ask), money(c.fee), money(c.cost), c.probability, c.edge, 'pending'))
         self.db.commit()
 
     def update(self, mode: str, ticker: str, status: str, order_id: str = None,
                result: str = None, pnl: Decimal = None):
-        self.db.execute('''UPDATE trades SET status=?, order_id=COALESCE(?,order_id),
-                           result=COALESCE(?,result),estimated_pnl=COALESCE(?,estimated_pnl)
-                           WHERE mode=? AND ticker=?''',
+        self.db.execute('''UPDATE bot_private.bot_trades SET status=%s, order_id=COALESCE(%s,order_id),
+                           result=COALESCE(%s,result),estimated_pnl=COALESCE(%s,estimated_pnl)
+                           WHERE mode=%s AND ticker=%s''',
                         (status, order_id, result, money(pnl) if pnl is not None else None,
                          mode, ticker))
         self.db.commit()
@@ -539,7 +544,7 @@ def tick(api: API, journal: Journal, cfg: Config):
 
 def print_status(journal: Journal, mode: str):
     rows = journal.db.execute('''SELECT day,ticker,side,count,price,status,result,estimated_pnl
-        FROM trades WHERE mode=? ORDER BY created DESC LIMIT 30''', (mode,)).fetchall()
+        FROM bot_private.bot_trades WHERE mode=%s ORDER BY created DESC LIMIT 30''', (mode,)).fetchall()
     for row in rows:
         print(' | '.join(str(v if v is not None else '-') for v in row))
     day = now_utc().astimezone(ET).date().isoformat()
@@ -554,6 +559,8 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     mode = os.getenv('MODE', 'paper').strip().lower()
+    if mode != 'paper':
+        raise ValueError('This Supabase cloud version is PAPER ONLY')
     if args.status:
         print_status(Journal(), mode)
         return
