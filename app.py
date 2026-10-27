@@ -63,9 +63,9 @@ def scan():
         proc = subprocess.run([sys.executable, str(ROOT/'bot.py'), '--once'], cwd=ROOT,
                               env=env, text=True, capture_output=True, timeout=22)
         st.session_state.scan_log = (proc.stdout + '\n' + proc.stderr)[-7000:] or 'No output.'
-        snapshots = re.findall(r'MARKET_SNAPSHOT ([^\\n]+)', st.session_state.scan_log)
+        snapshots = re.findall(r'MARKET_SNAPSHOT ([^\n]+)', st.session_state.scan_log)
         if snapshots:
-            fields = dict(re.findall(r'(\\w+)=([^\\s]+)', snapshots[-1]))
+            fields = dict(re.findall(r'(\w+)=([^\s]+)', snapshots[-1]))
             st.session_state.snapshot = fields
         if proc.returncode:
             st.session_state.running = False
