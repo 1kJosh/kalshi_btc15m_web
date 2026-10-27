@@ -1,0 +1,45 @@
+
+name: Kalshi Paper Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "2-59/5 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kalshi-paper-bot
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    env:
+      MODE: paper
+      ENABLE_LIVE: "false"
+      LIVE_CONFIRM: ""
+      KALSHI_KEY_ID: ""
+      KALSHI_PRIVATE_KEY_PATH: ""
+      MAX_ORDER_DOLLARS: "5"
+      MAX_DAILY_SPEND: "20"
+      MAX_TRADES_PER_DAY: "8"
+      MIN_EDGE: "0.12"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run paper scan
+        run: python bot.py --once
