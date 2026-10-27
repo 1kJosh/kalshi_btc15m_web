@@ -337,6 +337,35 @@ class Journal:
             yes_probability REAL NOT NULL, predicted_side TEXT NOT NULL,
             yes_ask TEXT, no_ask TEXT, decision TEXT NOT NULL,
             result TEXT, settled_at TEXT)''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS shadow_trades (
+            ticker TEXT NOT NULL, side TEXT NOT NULL, created TEXT NOT NULL,
+            ask REAL NOT NULL, estimated_fee REAL NOT NULL,
+            estimated_cost REAL NOT NULL, model_probability REAL NOT NULL,
+            model_edge REAL NOT NULL, filter_reasons TEXT NOT NULL,
+            result TEXT, estimated_pnl REAL, settled_at TEXT,
+            PRIMARY KEY (ticker,side))''')
+        self.db.commit()
+
+    def save_shadow(self, ticker, checks, multiplier):
+        # One quote per side per market, from the first scan inside the entry window.
+        # Counterfactual only: no execution or liquidity guarantee.
+        for check in checks:
+            try:
+                ask = Decimal(check['ask'])
+                if not Decimal('0') < ask < Decimal('1'):
+                    continue
+                fee = fee_estimate(1, ask, multiplier)
+                cost = ask + fee + Decimal('0.02')
+                probability = float(check['probability'])
+                edge = probability - float(cost)
+                self.db.execute('''INSERT OR IGNORE INTO shadow_trades
+                    (ticker,side,created,ask,estimated_fee,estimated_cost,
+                     model_probability,model_edge,filter_reasons)
+                    VALUES (?,?,?,?,?,?,?,?,?)''',
+                    (ticker,check['side'],now_utc().isoformat(),float(ask),
+                     float(fee),float(cost),probability,edge,check['reason']))
+            except (KeyError, ValueError, ArithmeticError):
+                continue
         self.db.commit()
 
     def save_prediction(self, ticker, spot, strike, remain, p_yes, yes_ask, no_ask, decision):
@@ -356,6 +385,12 @@ class Journal:
     def settle_prediction(self, ticker, result):
         self.db.execute('UPDATE predictions SET result=?, settled_at=? WHERE ticker=? AND result IS NULL',
                         (result,now_utc().isoformat(),ticker))
+        self.db.execute('''UPDATE shadow_trades
+            SET result=?, estimated_pnl=CASE WHEN side=? THEN 1.0-estimated_cost
+                                              ELSE -estimated_cost END,
+                settled_at=?
+            WHERE ticker=? AND result IS NULL''',
+            (result,result,now_utc().isoformat(),ticker))
         self.db.commit()
 
     def has_attempt(self, mode: str, ticker: str) -> bool:
@@ -460,7 +495,9 @@ def tick(api: API, journal: Journal, cfg: Config):
              yes_ask if yes_ask is not None else 'NA',
              no_ask if no_ask is not None else 'NA',
              spread if spread is not None else 'NA', market['close_time'])
-    for check in explain_filters(book, spot, strike, remain, multiplier, cfg):
+    checks = explain_filters(book, spot, strike, remain, multiplier, cfg)
+    journal.save_shadow(ticker, checks, multiplier)
+    for check in checks:
         LOG.info('FILTER_CHECK %s', ' '.join(f'{k}={v}' for k, v in check.items()))
     candidate = evaluate(book, spot, strike, remain, multiplier, cfg)
     decision = 'SIGNAL_' + candidate.side if candidate else 'SKIP'
