@@ -284,6 +284,31 @@ class Journal:
             model_probability REAL NOT NULL, edge REAL NOT NULL,
             status TEXT NOT NULL, order_id TEXT, result TEXT, estimated_pnl TEXT,
             PRIMARY KEY (mode,ticker))''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS predictions (
+            ticker TEXT PRIMARY KEY, created TEXT NOT NULL,
+            spot TEXT NOT NULL, strike TEXT NOT NULL, seconds_remaining INTEGER NOT NULL,
+            yes_probability REAL NOT NULL, predicted_side TEXT NOT NULL,
+            yes_ask TEXT, no_ask TEXT, decision TEXT NOT NULL,
+            result TEXT, settled_at TEXT)''')
+        self.db.commit()
+
+    def save_prediction(self, ticker, spot, strike, remain, p_yes, yes_ask, no_ask, decision):
+        # One independent observation per market: avoid inflating accuracy by repeated scans.
+        self.db.execute('''INSERT OR IGNORE INTO predictions
+            (ticker,created,spot,strike,seconds_remaining,yes_probability,predicted_side,yes_ask,no_ask,decision)
+            VALUES (?,?,?,?,?,?,?,?,?,?)''',
+            (ticker,now_utc().isoformat(),str(spot),str(strike),int(remain),float(p_yes),
+             'YES' if p_yes >= 0.5 else 'NO',str(yes_ask) if yes_ask is not None else None,
+             str(no_ask) if no_ask is not None else None,decision))
+        self.db.commit()
+
+    def pending_predictions(self, limit=15):
+        return [r[0] for r in self.db.execute(
+            'SELECT ticker FROM predictions WHERE result IS NULL ORDER BY created LIMIT ?', (limit,))]
+
+    def settle_prediction(self, ticker, result):
+        self.db.execute('UPDATE predictions SET result=?, settled_at=? WHERE ticker=? AND result IS NULL',
+                        (result,now_utc().isoformat(),ticker))
         self.db.commit()
 
     def has_attempt(self, mode: str, ticker: str) -> bool:
@@ -335,6 +360,19 @@ def reconcile(api: API, journal: Journal, cfg: Config):
             LOG.warning('Settlement status unavailable for %s: %s', ticker, exc)
 
 
+def reconcile_predictions(api: API, journal: Journal):
+    # Only exchange-confirmed final YES/NO outcomes count. No Coinbase-derived settlement.
+    for ticker in journal.pending_predictions():
+        try:
+            market = api.market(ticker)
+            result = str(market.get('result') or '').lower()
+            if result in ('yes', 'no'):
+                journal.settle_prediction(ticker, result.upper())
+                LOG.info('PREDICTION_SETTLED ticker=%s result=%s', ticker, result.upper())
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            LOG.warning('Prediction result pending for %s: %s', ticker, exc)
+
+
 def tick(api: API, journal: Journal, cfg: Config):
     now = now_utc()
     today = now.astimezone(ET).date().isoformat()
@@ -374,6 +412,8 @@ def tick(api: API, journal: Journal, cfg: Config):
              no_ask if no_ask is not None else 'NA',
              spread if spread is not None else 'NA')
     candidate = evaluate(book, spot, strike, remain, multiplier, cfg)
+    decision = 'SIGNAL_' + candidate.side if candidate else 'SKIP'
+    journal.save_prediction(ticker, spot, strike, remain, p_yes, yes_ask, no_ask, decision)
     if not candidate:
         LOG.info('%s spot=%s strike=%s seconds=%d: no eligible edge', ticker, spot, strike, remain)
         return
@@ -453,6 +493,7 @@ def main():
         try:
             if iteration % 3 == 0:
                 reconcile(api, journal, cfg)
+            reconcile_predictions(api, journal)
             tick(api, journal, cfg)
         except UncertainLiveOrderError:
             LOG.critical('CRITICAL: Live order may exist. Bot halted; manually inspect orders and account.')
