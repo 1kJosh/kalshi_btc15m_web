@@ -1,0 +1,4 @@
+streamlit>=1.40,<2
+requests>=2.31,<3
+cryptography>=42,<47
+python-dotenv>=1,<2
