@@ -18,7 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
 
+    
     env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       MODE: paper
       ENABLE_LIVE: "false"
       LIVE_CONFIRM: ""
@@ -29,6 +31,7 @@ jobs:
       MAX_TRADES_PER_DAY: "8"
       MIN_EDGE: "0.12"
 
+      
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
