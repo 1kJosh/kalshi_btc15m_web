@@ -273,6 +273,53 @@ def evaluate(book: dict, spot: Decimal, strike: Decimal, remaining: float,
     return max(possibilities, key=lambda c: c.edge * c.count) if possibilities else None
 
 
+def explain_filters(book: dict, spot: Decimal, strike: Decimal, remaining: float,
+                    multiplier: Decimal, cfg: Config) -> list[dict]:
+    """Explain entry eligibility using the same thresholds as evaluate()."""
+    yes_bid, no_bid = _top(book, 'yes_dollars'), _top(book, 'no_dollars')
+    p_yes = model_probability(spot, strike, remaining, cfg.annual_vol)
+    gap = abs(spot - strike)
+    if not yes_bid or not no_bid:
+        return [{'side': side, 'status': 'FAIL', 'reason': 'missing_orderbook_liquidity'}
+                for side in ('YES', 'NO')]
+    yes_ask, yes_liq = Decimal('1') - no_bid[0], no_bid[1]
+    no_ask, no_liq = Decimal('1') - yes_bid[0], yes_bid[1]
+    spread = yes_ask - yes_bid[0]
+    results = []
+    for side, ask, liq, prob in (('YES', yes_ask, yes_liq, p_yes),
+                                 ('NO', no_ask, no_liq, 1-p_yes)):
+        reasons = []
+        if spread < 0 or spread > cfg.max_spread:
+            reasons.append('spread')
+        if gap < Decimal(str(cfg.min_gap)):
+            reasons.append('spot_strike_gap')
+        if not Decimal('0.20') <= ask <= Decimal('0.85'):
+            reasons.append('contract_price')
+        if prob < 0.60:
+            reasons.append('model_probability')
+        available = min(cfg.max_contracts, liq)
+        feasible = []
+        for count in range(available, 0, -1):
+            fee = fee_estimate(count, ask, multiplier)
+            cost = ask * count + fee + Decimal('0.02')
+            if cost <= cfg.max_order_dollars and cost <= cfg.max_daily_spend:
+                feasible.append((count, fee, cost))
+        if not feasible:
+            reasons.append('order_budget')
+            best_edge = None
+        else:
+            best_edge = max(prob - float(ask + (fee + Decimal('0.02')) / count)
+                            for count, fee, cost in feasible)
+            if best_edge < cfg.min_edge:
+                reasons.append('model_edge')
+        results.append({'side': side, 'status': 'FAIL' if reasons else 'PASS',
+                        'reason': ','.join(reasons) if reasons else 'eligible',
+                        'ask': str(ask), 'probability': f'{prob:.4f}',
+                        'liquidity': liq, 'spread': str(spread),
+                        'gap': str(gap), 'edge': 'NA' if best_edge is None else f'{best_edge:.4f}'})
+    return results
+
+
 class Journal:
     def __init__(self):
         HERE.joinpath('data').mkdir(exist_ok=True)
@@ -390,6 +437,8 @@ def tick(api: API, journal: Journal, cfg: Config):
     remain = (iso_time(market['close_time']) - now).total_seconds()
     elapsed = (now - iso_time(market['open_time'])).total_seconds()
     if elapsed < cfg.earliest_entry_elapsed or remain < cfg.latest_entry_remaining:
+        LOG.info('ENTRY_WINDOW_SKIP ticker=%s elapsed=%.0f remaining=%.0f min_elapsed=%d min_remaining=%d',
+                 ticker, elapsed, remain, cfg.earliest_entry_elapsed, cfg.latest_entry_remaining)
         return
     if market.get('floor_strike') is None:
         LOG.info('%s: strike not published yet', ticker)
@@ -406,11 +455,13 @@ def tick(api: API, journal: Journal, cfg: Config):
     yes_ask = (Decimal('1') - no_bid[0]) if no_bid else None
     no_ask = (Decimal('1') - yes_bid[0]) if yes_bid else None
     spread = (yes_ask - yes_bid[0]) if yes_ask is not None and yes_bid else None
-    LOG.info('MARKET_SNAPSHOT ticker=%s spot=%s strike=%s seconds=%d yes_probability=%.4f no_probability=%.4f yes_ask=%s no_ask=%s spread=%s',
+    LOG.info('MARKET_SNAPSHOT ticker=%s spot=%s strike=%s seconds=%d yes_probability=%.4f no_probability=%.4f yes_ask=%s no_ask=%s spread=%s close_time=%s',
              ticker, spot, strike, remain, p_yes, 1-p_yes,
              yes_ask if yes_ask is not None else 'NA',
              no_ask if no_ask is not None else 'NA',
-             spread if spread is not None else 'NA')
+             spread if spread is not None else 'NA', market['close_time'])
+    for check in explain_filters(book, spot, strike, remain, multiplier, cfg):
+        LOG.info('FILTER_CHECK %s', ' '.join(f'{k}={v}' for k, v in check.items()))
     candidate = evaluate(book, spot, strike, remain, multiplier, cfg)
     decision = 'SIGNAL_' + candidate.side if candidate else 'SKIP'
     journal.save_prediction(ticker, spot, strike, remain, p_yes, yes_ask, no_ask, decision)
