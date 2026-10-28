@@ -149,23 +149,23 @@ def monitor():
     
     milestone_rows = []
     
-    for milestone in (25, 50, 75, 100):
-    if len(chronological) >= milestone:
-        sample = chronological[:milestone]
+    for milestone in milestones:
+        if len(chronological) >= milestone:
+            sample = chronological[:milestone]
     
-        wins = sum(
+            wins = sum(
             r.get("predicted_side") == r.get("result")
             for r in sample
-        )
+            )
     
-        accuracy = 100 * wins / milestone
+            accuracy = 100 * wins / milestone
     
-        valid = [
+            valid = [
             r for r in sample
             if safe_float(r.get("yes_probability")) is not None
-        ]
+            ]
     
-        milestone_brier = (
+            milestone_brier = (
             sum(
                 (
                     safe_float(r["yes_probability"])
@@ -176,7 +176,7 @@ def monitor():
             if valid else None
         )
     
-        milestone_rows.append({
+            milestone_rows.append({
             "Milestone": milestone,
             "Status": "Completed",
             "Accuracy": f"{accuracy:.1f}%",
@@ -185,7 +185,7 @@ def monitor():
                 if milestone_brier is not None
                 else "—"
             ),
-        })
+            })
     else:
         milestone_rows.append({
             "Milestone": milestone,
