@@ -201,16 +201,15 @@ def monitor():
     )
     
     if settled_count >= target:
-    st.success(
-        "100 settled predictions collected! "
-        "Ready for a full performance review."
-    )
+        st.success(
+            "100 settled predictions collected! "
+            "Ready for a full performance review."
+        )
     else:
-    st.info(
-        f"Continue paper testing with the existing filters. "
-        f"{remaining} more settled predictions needed."
-    )
-
+        st.info(
+            "Continue paper testing with the existing filters. "
+            f"{remaining} more settled predictions needed."
+        )
     if completed:
         hits = 0
         chart = []
