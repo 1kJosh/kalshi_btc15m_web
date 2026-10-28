@@ -146,7 +146,7 @@ def monitor():
     completed,
     key=lambda row: str(row.get("created", ""))
     )
-    
+    milestones = [10, 25, 50, 75, 100]
     milestone_rows = []
     
     for milestone in milestones:
