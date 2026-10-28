@@ -114,6 +114,103 @@ def monitor():
     b.metric("Settled predictions", len(completed))
     c.metric("Directional accuracy", f"{100 * correct / len(completed):.1f}%" if completed else "—")
     d.metric("Brier score (lower better)", f"{brier:.3f}" if brier is not None else "—")
+
+    
+# 100-Prediction Performance Tracker
+st.markdown("### 100-Prediction Testing Progress")
+
+target = 100
+settled_count = len(completed)
+progress = min(settled_count / target, 1.0)
+
+st.progress(progress)
+st.caption(f"{settled_count} / {target} settled predictions")
+
+remaining = max(target - settled_count, 0)
+
+p1, p2, p3 = st.columns(3)
+p1.metric("Predictions remaining", remaining)
+p2.metric(
+    "Current accuracy",
+    f"{100 * correct / settled_count:.1f}%" if settled_count else "—"
+)
+p3.metric(
+    "Current Brier score",
+    f"{brier:.3f}" if brier is not None else "—"
+)
+
+# Historical performance at fixed milestones
+st.markdown("#### Performance milestones")
+
+chronological = sorted(
+    completed,
+    key=lambda row: str(row.get("created", ""))
+)
+
+milestone_rows = []
+
+for milestone in (25, 50, 75, 100):
+    if len(chronological) >= milestone:
+        sample = chronological[:milestone]
+
+        wins = sum(
+            r.get("predicted_side") == r.get("result")
+            for r in sample
+        )
+
+        accuracy = 100 * wins / milestone
+
+        valid = [
+            r for r in sample
+            if safe_float(r.get("yes_probability")) is not None
+        ]
+
+        milestone_brier = (
+            sum(
+                (
+                    safe_float(r["yes_probability"])
+                    - (1 if r["result"] == "YES" else 0)
+                ) ** 2
+                for r in valid
+            ) / len(valid)
+            if valid else None
+        )
+
+        milestone_rows.append({
+            "Milestone": milestone,
+            "Status": "Completed",
+            "Accuracy": f"{accuracy:.1f}%",
+            "Brier score": (
+                f"{milestone_brier:.3f}"
+                if milestone_brier is not None
+                else "—"
+            ),
+        })
+    else:
+        milestone_rows.append({
+            "Milestone": milestone,
+            "Status": "Pending",
+            "Accuracy": "—",
+            "Brier score": "—",
+        })
+
+st.dataframe(
+    milestone_rows,
+    hide_index=True,
+    use_container_width=True
+)
+
+if settled_count >= target:
+    st.success(
+        "100 settled predictions collected! "
+        "Ready for a full performance review."
+    )
+else:
+    st.info(
+        f"Continue paper testing with the existing filters. "
+        f"{remaining} more settled predictions needed."
+    )
+
     if completed:
         hits = 0
         chart = []
