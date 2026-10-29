@@ -593,10 +593,12 @@ def main():
         except UncertainLiveOrderError:
             LOG.critical('CRITICAL: Live order may exist. Bot halted; manually inspect orders and account.')
             raise SystemExit(2)
+        
         except requests.RequestException as exc:
             LOG.warning('Market data/network error; skipping scan: %s', exc)
-             if args.once:
+            if args.once:
                 raise
+
         except (KeyError, ValueError, TypeError, ArithmeticError) as exc:
             LOG.warning('Bad/missing market input; skipping scan: %s', exc)
         iteration += 1
