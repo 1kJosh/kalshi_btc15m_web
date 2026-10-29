@@ -245,6 +245,57 @@ def monitor():
     st.dataframe(shadow[:200], hide_index=True, use_container_width=True)
     st.download_button("Download shadow-trade history (CSV)", csv_data(shadow), file_name="kalshi_shadow_trades.csv", mime="text/csv")
 
+    # Filter Rejection Analysis
+    st.subheader("Filter Rejection Analysis")
+    st.caption(
+        "Counts show how often each reason appears in saved shadow quotes. "
+        "One quote may fail multiple filters, so counts can overlap."
+    )
+
+    rejection_counts = {}
+    rejected_quotes = 0
+
+    for quote in shadow:
+        reasons = str(quote.get("filter_reasons") or "").strip()
+
+        if not reasons or reasons == "eligible":
+            continue
+
+        rejected_quotes += 1
+
+        for reason in reasons.split(","):
+            reason = reason.strip()
+            if reason:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
+    st.metric("Total rejected shadow quotes", rejected_quotes)
+
+    if rejection_counts:
+        rejection_rows = [
+            {
+                "Rejection reason": reason.replace("_", " ").title(),
+                "Occurrences": count,
+                "Share of rejected quotes": f"{100 * count / rejected_quotes:.1f}%"
+            }
+            for reason, count in sorted(
+                rejection_counts.items(),
+                key=lambda item: item[1],
+                reverse=True
+            )
+        ]
+
+        st.bar_chart(
+            {row["Rejection reason"]: row["Occurrences"] for row in rejection_rows}
+        )
+
+        st.dataframe(
+            rejection_rows,
+            hide_index=True,
+            use_container_width=True
+        )
+    else:
+        st.info("No rejected shadow quotes recorded yet.")
+    
     st.subheader("Simulated paper trades")
     st.caption("Only entries actually recorded in bot_trades count as simulated trades; predictions and shadow quotes do not.")
     today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
