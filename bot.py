@@ -43,6 +43,10 @@ class UncertainLiveOrderError(RuntimeError):
     """Submission failed or execution ambiguous: stop immediately, never auto-retry."""
 
 
+class ReservationRejected(RuntimeError):
+    """Paper reservation rejected because a trading cap was reached."""
+
+
 
 def env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
@@ -412,13 +416,41 @@ class Journal:
                                   WHERE mode=%s AND status='filled' ''', (mode,)).fetchall()
 
     def reserve(self, cfg: Config, market: dict, c: Choice, day: str):
-        # Durable before network request: on timeout/restart, never repeat the trade.
-        self.db.execute('''INSERT INTO bot_private.bot_trades
-          (mode,ticker,day,created,side,count,price,fee,reserved,model_probability,edge,status)
-          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
-          (cfg.mode, market['ticker'], day, now_utc().isoformat(), c.side, c.count,
-           money(c.ask), money(c.fee), money(c.cost), c.probability, c.edge, 'pending'))
+        """Atomically reserve one paper trade under the shared daily limits.
+
+        All reservation writers must use the same advisory-lock convention.
+        A duplicate (mode, ticker) still fails closed via the primary key.
+        """
+        # Previous prediction/shadow reads may have opened a transaction.
+        # End it so transaction() owns the real transaction, not a savepoint.
         self.db.commit()
+        with self.db.transaction():
+            self.db.execute(
+                'SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))',
+                ('kalshi-paper-reserve:' + cfg.mode, day)
+            )
+            trades, spent = self.db.execute(
+                """SELECT COUNT(*), COALESCE(SUM(reserved::numeric), 0)
+                   FROM bot_private.bot_trades
+                   WHERE mode=%s AND day=%s""",
+                (cfg.mode, day)
+            ).fetchone()
+            cost = Decimal(c.cost)
+            if trades >= cfg.max_trades:
+                raise ReservationRejected('daily trade-count limit reached')
+            if not cost.is_finite() or cost <= 0 or cost > cfg.max_order_dollars:
+                raise ReservationRejected('invalid or over-limit order cost')
+            if spent + cost > cfg.max_daily_spend:
+                raise ReservationRejected('daily reserved-spend limit reached')
+            self.db.execute(
+                """INSERT INTO bot_private.bot_trades
+                   (mode,ticker,day,created,side,count,price,fee,reserved,
+                    model_probability,edge,status)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (cfg.mode, market['ticker'], day, now_utc().isoformat(),
+                 c.side, c.count, money(c.ask), money(c.fee), money(cost),
+                 c.probability, c.edge, 'pending')
+            )
 
     def update(self, mode: str, ticker: str, status: str, order_id: str = None,
                result: str = None, pnl: Decimal = None):
@@ -519,7 +551,11 @@ def tick(api: API, journal: Journal, cfg: Config):
              candidate.probability * 100, candidate.edge * 100, candidate.cost)
     if cfg.mode == 'live':
         api.account_safe(ticker, candidate.cost)
-    journal.reserve(cfg, market, candidate, today)
+    try:
+        journal.reserve(cfg, market, candidate, today)
+    except ReservationRejected as exc:
+        LOG.info('RESERVATION_SKIP ticker=%s reason=%s', ticker, exc)
+        return
     if cfg.mode == 'paper':
         journal.update(cfg.mode, ticker, 'filled', order_id='PAPER-SIMULATED')
         LOG.info('PAPER SIMULATION recorded; assumes top-of-book fill without slippage')
