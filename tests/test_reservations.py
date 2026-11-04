@@ -106,9 +106,12 @@ class ReservationTests(unittest.TestCase):
         self.assertEqual(self.totals()[0], 0)
 
     def test_duplicate_ticker_is_rejected_by_primary_key(self):
-        self.reserve("DUP")
+        # Leave ample daily budget so the PRIMARY KEY, not the spend cap,
+        # is the expected reason the second reservation fails.
+        cfg = replace(self.cfg, max_daily_spend=Decimal("20"))
+        self.reserve("DUP", cfg=cfg)
         with self.assertRaises(psycopg.errors.UniqueViolation):
-            self.reserve("DUP")
+            self.reserve("DUP", cfg=cfg)
         self.assertEqual(self.totals()[0], 1)
 
 
